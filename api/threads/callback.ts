@@ -1,15 +1,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 /**
- * Threads OAuth callback（確認用・安全版）
- *
- * 目的：
- * - code を access_token に交換
- * - threads_user_id を取得
- * - 画面には threads_user_id のみ表示（access_token は表示しない）
- *
- * ※ 保存処理（DynamoDB等）はしない
- * ※ 本番では access_token を画面に出さない（この版はOK）
+ * Threads OAuth callback
+ * 1. code を受け取る
+ * 2. access_token に交換
+ * 3. threads_user_id を取得
+ * ※ まずは「取得できることの確認」用に JSON で返す
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -17,8 +13,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!code) {
       return res.status(400).json({
-        ok: false,
         error: "missing_code",
+        query: req.query,
       });
     }
 
@@ -28,37 +24,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const THREADS_REDIRECT_URI = process.env.THREADS_REDIRECT_URI!;
     // =======================================
 
-    // 1) code → access_token
-    const tokenResp = await fetch("https://graph.threads.net/oauth/access_token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: THREADS_APP_ID,
-        client_secret: THREADS_APP_SECRET,
-        grant_type: "authorization_code",
-        redirect_uri: THREADS_REDIRECT_URI,
-        code,
-      }),
-    });
+    /**
+     * 1) code → access_token
+     */
+    const tokenResp = await fetch(
+      "https://graph.threads.net/oauth/access_token",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          client_id: THREADS_APP_ID,
+          client_secret: THREADS_APP_SECRET,
+          grant_type: "authorization_code",
+          redirect_uri: THREADS_REDIRECT_URI,
+          code,
+        }),
+      }
+    );
 
     const tokenData = await tokenResp.json();
 
-    if (!tokenResp.ok || !tokenData.access_token) {
-      // tokenData はデバッグに便利ですが、念のため最小限だけ返す
-      console.error("Token exchange failed:", {
-        status: tokenResp.status,
-        error: tokenData?.error,
-      });
+    if (!tokenResp.ok) {
       return res.status(400).json({
-        ok: false,
         step: "token_exchange_failed",
-        error: tokenData?.error ?? tokenData,
+        tokenData,
       });
     }
 
-    const threadsAccessToken: string = tokenData.access_token;
+    const threadsAccessToken = tokenData.access_token;
+    if (!threadsAccessToken) {
+      return res.status(400).json({
+        step: "no_access_token",
+        tokenData,
+      });
+    }
 
-    // 2) threads_user_id 取得
+    /**
+     * 2) threads_user_id を取得
+     */
     const meResp = await fetch(
       `https://graph.threads.net/v1.0/me?fields=id,username&access_token=${encodeURIComponent(
         threadsAccessToken
@@ -67,32 +72,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const meData = await meResp.json();
 
-    if (!meResp.ok || !meData?.id) {
-      console.error("Me fetch failed:", {
-        status: meResp.status,
-        meData,
-      });
+    if (!meResp.ok) {
       return res.status(400).json({
-        ok: false,
         step: "me_failed",
-        error: meData,
+        meData,
       });
     }
 
-    // ✅ 画面に返すのは ID/username のみ（tokenは返さない）
+    /**
+     * ★ 成功時のレスポンス（確認用）
+     * 本番では token は返さず DynamoDB 等に保存する
+     */
     return res.status(200).json({
       ok: true,
-      threads_user: {
-        id: meData.id,
-        username: meData.username,
-      },
-      note: "access_token is NOT returned. Save it manually if needed.",
+      threads_user: meData, // { id, username }
+      threads_access_token: threadsAccessToken,
     });
   } catch (err: any) {
-    console.error("Callback exception:", err);
     return res.status(500).json({
-      ok: false,
-      error: "internal_error",
+      error: "exception",
+      message: err?.message ?? String(err),
     });
   }
 }
